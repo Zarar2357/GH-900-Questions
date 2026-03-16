@@ -6,6 +6,13 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "docs",
-    emptyOutDir: true
+    emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        entryFileNames: "assets/app.js",
+        chunkFileNames: "assets/[name].js",
+        assetFileNames: "assets/[name][extname]"
+      }
+    }
   }
 });
