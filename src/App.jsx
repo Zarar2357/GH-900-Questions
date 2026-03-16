@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
+import { ambiguousQuestions, strictAnswerKey, strictScoredQuestionCount } from "./answerKey";
 import { quizQuestions } from "./quizData";
 
-const STORAGE_KEY = "github-quiz-studio-state-v2";
+const STORAGE_KEY = "github-quiz-studio-state-v4";
 const EXAM_DURATION_SECONDS = 90 * 60;
-const EMPTY_SCORE = null;
 
 function loadExamState() {
   try {
@@ -56,12 +56,43 @@ function formatTime(totalSeconds) {
   return `${hours}:${minutes}:${seconds}`;
 }
 
+function sameAnswers(left = [], right = []) {
+  if (left.length !== right.length) return false;
+  const leftSorted = [...left].sort((a, b) => a - b);
+  const rightSorted = [...right].sort((a, b) => a - b);
+  return leftSorted.every((value, index) => value === rightSorted[index]);
+}
+
 function getQuestionStatus(question, answers, flagged) {
   const selected = answers[question.id] || [];
   if (flagged[question.id] && selected.length > 0) return "flagged-answered";
   if (flagged[question.id]) return "flagged";
   if (selected.length > 0) return "answered";
   return "unanswered";
+}
+
+function getQuestionResult(questionId, answers) {
+  const selected = answers[questionId] || [];
+  const correct = strictAnswerKey[questionId];
+  if (!correct) return "excluded";
+  if (!selected.length) return "unanswered";
+  return sameAnswers(selected, correct) ? "correct" : "incorrect";
+}
+
+function getOptionReviewState(questionId, optionIndex, answers) {
+  const strictAnswer = strictAnswerKey[questionId];
+  if (!strictAnswer) return "neutral";
+
+  const selected = (answers[questionId] || []).includes(optionIndex);
+  const correct = strictAnswer.includes(optionIndex);
+  if (correct && selected) return "correct-selected";
+  if (correct) return "correct";
+  if (selected) return "incorrect-selected";
+  return "neutral";
+}
+
+function getQuestionNumberLabel(question) {
+  return question.label.replace("Question ", "");
 }
 
 export default function App() {
@@ -72,7 +103,7 @@ export default function App() {
   const [showSubmitModal, setShowSubmitModal] = useState(false);
   const [showResults, setShowResults] = useState(false);
 
-  const { answers, flagged, submitted, timeLeft, submittedAt, startedAt } = examState;
+  const { answers, flagged, submitted, timeLeft, submittedAt } = examState;
 
   useEffect(() => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(examState));
@@ -111,15 +142,8 @@ export default function App() {
     [answers]
   );
 
-  const flaggedCount = useMemo(
-    () => Object.values(flagged).filter(Boolean).length,
-    [flagged]
-  );
-
-  const multiCount = useMemo(
-    () => quizQuestions.filter((question) => question.choose > 1).length,
-    []
-  );
+  const flaggedCount = useMemo(() => Object.values(flagged).filter(Boolean).length, [flagged]);
+  const multiCount = useMemo(() => quizQuestions.filter((question) => question.choose > 1).length, []);
 
   const visibleQuestions = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -127,6 +151,7 @@ export default function App() {
       const selected = answers[question.id] || [];
       const isAnswered = selected.length > 0;
       const isFlagged = Boolean(flagged[question.id]);
+      const isExcluded = !strictAnswerKey[question.id];
       const haystack = `${question.label} ${question.prompt} ${question.options.join(" ")}`.toLowerCase();
       const matchesSearch = !query || haystack.includes(query);
       const matchesFilter =
@@ -134,38 +159,33 @@ export default function App() {
         filter === "answered" ? isAnswered :
         filter === "unanswered" ? !isAnswered :
         filter === "flagged" ? isFlagged :
+        filter === "excluded" ? isExcluded :
         question.choose > 1;
 
       return matchesSearch && matchesFilter;
     });
   }, [answers, flagged, filter, search]);
 
-  const progress = quizQuestions.length
-    ? Math.round((answeredCount / quizQuestions.length) * 100)
-    : 0;
-
-  const completionScore = `${Math.round((answeredCount / quizQuestions.length) * 100)}%`;
+  const progress = quizQuestions.length ? Math.round((answeredCount / quizQuestions.length) * 100) : 0;
   const unansweredCount = quizQuestions.length - answeredCount;
-  const attemptedCount = answeredCount;
-  const score = EMPTY_SCORE;
-  const statusBreakdown = useMemo(() => {
-    const counts = {
-      answered: 0,
-      unanswered: 0,
-      flagged: 0,
-      flaggedAnswered: 0
-    };
+
+  const scoreSummary = useMemo(() => {
+    let correct = 0;
+    let incorrect = 0;
+    let blank = 0;
+    let excluded = 0;
 
     quizQuestions.forEach((question) => {
-      const status = getQuestionStatus(question, answers, flagged);
-      if (status === "answered") counts.answered += 1;
-      if (status === "unanswered") counts.unanswered += 1;
-      if (status === "flagged") counts.flagged += 1;
-      if (status === "flagged-answered") counts.flaggedAnswered += 1;
+      const result = getQuestionResult(question.id, answers);
+      if (result === "correct") correct += 1;
+      else if (result === "incorrect") incorrect += 1;
+      else if (result === "unanswered") blank += 1;
+      else excluded += 1;
     });
 
-    return counts;
-  }, [answers, flagged]);
+    const percent = strictScoredQuestionCount ? Math.round((correct / strictScoredQuestionCount) * 100) : 0;
+    return { correct, incorrect, blank, excluded, percent };
+  }, [answers]);
 
   function updateAnswer(question, optionIndex) {
     if (submitted) return;
@@ -173,9 +193,8 @@ export default function App() {
     setExamState((current) => {
       const next = new Set(current.answers[question.id] || []);
       if (question.choose === 1) {
-        if (next.has(optionIndex)) {
-          next.clear();
-        } else {
+        if (next.has(optionIndex)) next.clear();
+        else {
           next.clear();
           next.add(optionIndex);
         }
@@ -201,24 +220,15 @@ export default function App() {
 
   function toggleFlag(questionId) {
     if (submitted) return;
-
     setExamState((current) => ({
       ...current,
-      flagged: {
-        ...current.flagged,
-        [questionId]: !current.flagged[questionId]
-      }
+      flagged: { ...current.flagged, [questionId]: !current.flagged[questionId] }
     }));
   }
 
   function clearAll() {
     if (submitted) return;
-
-    setExamState((current) => ({
-      ...current,
-      answers: {},
-      flagged: {}
-    }));
+    setExamState((current) => ({ ...current, answers: {}, flagged: {} }));
   }
 
   function resetExam() {
@@ -239,17 +249,11 @@ export default function App() {
 
   function jumpToFirstUnanswered() {
     const target = quizQuestions.find((question) => (answers[question.id] || []).length === 0);
-    if (target) {
-      document.getElementById(target.id)?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
+    if (target) document.getElementById(target.id)?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
   function submitExam() {
-    setExamState((current) => ({
-      ...current,
-      submitted: true,
-      submittedAt: Date.now()
-    }));
+    setExamState((current) => ({ ...current, submitted: true, submittedAt: Date.now() }));
   }
 
   function scrollToQuestion(questionId) {
@@ -261,11 +265,11 @@ export default function App() {
       <header className="exam-topbar panel">
         <div className="topbar-group">
           <div>
-            <div className="eyebrow">Professional Exam Mode</div>
+            <div className="eyebrow">High-Confidence Exam Mode</div>
             <h1 className="topbar-title">GitHub Certification Simulator</h1>
           </div>
           <p className="topbar-copy">
-            Timed, review-friendly, and submission-ready. The exact correct-answer score will appear as soon as you provide the answer key.
+            This stricter pass scores only high-confidence questions. Ambiguous items are still visible for practice, but they are excluded from the final score.
           </p>
         </div>
 
@@ -275,15 +279,11 @@ export default function App() {
             <strong>{formatTime(timeLeft)}</strong>
           </div>
           <div className="time-card subtle">
-            <span className="time-label">Progress</span>
-            <strong>{progress}%</strong>
+            <span className="time-label">Strict Score</span>
+            <strong>{submitted ? `${scoreSummary.percent}%` : `${progress}%`}</strong>
           </div>
-          <button className="ghost" onClick={() => setFocusMode((value) => !value)}>
-            {focusMode ? "Exit Focus" : "Focus Mode"}
-          </button>
-          <button className="primary submit-button" onClick={() => setShowSubmitModal(true)}>
-            Submit Exam
-          </button>
+          <button className="ghost" onClick={() => setFocusMode((value) => !value)}>{focusMode ? "Exit Focus" : "Focus Mode"}</button>
+          <button className="primary submit-button" onClick={() => setShowSubmitModal(true)}>Submit Exam</button>
         </div>
       </header>
 
@@ -292,34 +292,18 @@ export default function App() {
           <div className="brand">
             <span className="eyebrow">Exam Dashboard</span>
             <h2 className="sidebar-title">Attempt Overview</h2>
-            <div className="lede">
-              Navigate quickly, flag questions for review, and submit once you are satisfied with your attempt.
-            </div>
+            <div className="lede">Navigate quickly, flag questions for review, and submit once you are satisfied with your attempt.</div>
           </div>
 
           <div className="stats stats-three">
-            <div className="stat">
-              <strong>{quizQuestions.length}</strong>
-              <span className="muted">questions</span>
-            </div>
-            <div className="stat">
-              <strong>{answeredCount}</strong>
-              <span className="muted">answered</span>
-            </div>
-            <div className="stat">
-              <strong>{flaggedCount}</strong>
-              <span className="muted">flagged</span>
-            </div>
+            <div className="stat"><strong>{quizQuestions.length}</strong><span className="muted">questions</span></div>
+            <div className="stat"><strong>{answeredCount}</strong><span className="muted">answered</span></div>
+            <div className="stat"><strong>{scoreSummary.excluded}</strong><span className="muted">excluded</span></div>
           </div>
 
           <div className="progress-wrap">
-            <div className="progress-meta">
-              <span>Attempt Completion</span>
-              <strong>{completionScore}</strong>
-            </div>
-            <div className="bar">
-              <span style={{ width: `${progress}%` }} />
-            </div>
+            <div className="progress-meta"><span>Attempt Completion</span><strong>{progress}%</strong></div>
+            <div className="bar"><span style={{ width: `${progress}%` }} /></div>
           </div>
 
           <div className="legend-grid">
@@ -327,38 +311,25 @@ export default function App() {
             <span className="legend-chip unanswered">Unanswered</span>
             <span className="legend-chip flagged">Flagged</span>
             <span className="legend-chip flagged-answered">Flagged + answered</span>
+            {submitted && <span className="legend-chip correct">Correct</span>}
+            {submitted && <span className="legend-chip incorrect">Incorrect</span>}
+            {submitted && <span className="legend-chip excluded">Excluded</span>}
           </div>
 
           <div className="question-palette">
             {quizQuestions.map((question, index) => {
-              const status = getQuestionStatus(question, answers, flagged);
-              return (
-                <button
-                  key={question.id}
-                  className={`palette-item ${status}`}
-                  onClick={() => scrollToQuestion(question.id)}
-                  title={`${question.label}: ${status.replace("-", " ")}`}
-                >
-                  {index + 1}
-                </button>
-              );
+              const status = submitted ? getQuestionResult(question.id, answers) : getQuestionStatus(question, answers, flagged);
+              return <button key={question.id} className={`palette-item ${status}`} onClick={() => scrollToQuestion(question.id)}>{index + 1}</button>;
             })}
           </div>
 
           <div className="navigator">
             {quizQuestions.map((question) => {
-              const status = getQuestionStatus(question, answers, flagged);
+              const status = submitted ? getQuestionResult(question.id, answers) : getQuestionStatus(question, answers, flagged);
               const isVisible = visibleQuestions.some((item) => item.id === question.id);
               return (
-                <button
-                  key={question.id}
-                  className={`nav-item ${status} ${isVisible ? "active" : ""}`}
-                  onClick={() => scrollToQuestion(question.id)}
-                >
-                  <div className="nav-topline">
-                    <span>{question.label}</span>
-                    <span>{question.choose > 1 ? `Pick ${question.choose}` : "Pick 1"}</span>
-                  </div>
+                <button key={question.id} className={`nav-item ${status} ${isVisible ? "active" : ""}`} onClick={() => scrollToQuestion(question.id)}>
+                  <div className="nav-topline"><span>{question.label}</span><span>{question.choose > 1 ? `Pick ${question.choose}` : "Pick 1"}</span></div>
                   <div className="nav-title">{question.prompt}</div>
                 </button>
               );
@@ -375,62 +346,28 @@ export default function App() {
           <section className="hero panel exam-hero">
             <div className="hero-grid">
               <div>
-                <span className="eyebrow hero-eyebrow">Live Attempt</span>
-                <h2>Simulate the pressure, keep the clarity.</h2>
-                <p>
-                  Search the exam, narrow by flagged or unanswered questions, and submit with a final review like a real certification practice environment.
-                </p>
+                <span className="eyebrow hero-eyebrow">Strict Scoring</span>
+                <h2>Practice hard, score carefully.</h2>
+                <p>Only high-confidence answers count toward the final score. Ambiguous legacy questions are still shown for study, but they are reported separately instead of affecting your grade.</p>
               </div>
               <div className="hero-cards">
-                <div className="hero-card">
-                  <strong>{multiCount}</strong>
-                  <span>multi-select prompts</span>
-                </div>
-                <div className="hero-card">
-                  <strong>{quizQuestions.length - multiCount}</strong>
-                  <span>single-select prompts</span>
-                </div>
-                <div className="hero-card">
-                  <strong>{attemptedCount}</strong>
-                  <span>attempted so far</span>
-                </div>
-                <div className="hero-card">
-                  <strong>{unansweredCount}</strong>
-                  <span>still unanswered</span>
-                </div>
+                <div className="hero-card"><strong>{strictScoredQuestionCount}</strong><span>strictly scored entries</span></div>
+                <div className="hero-card"><strong>{ambiguousQuestions.length}</strong><span>ambiguous question numbers</span></div>
+                <div className="hero-card"><strong>{multiCount}</strong><span>multi-select prompts</span></div>
+                <div className="hero-card"><strong>{flaggedCount}</strong><span>flagged right now</span></div>
               </div>
             </div>
           </section>
 
           <section className="toolbar panel">
             <div className="toolbar-top">
-              <input
-                className="search"
-                type="search"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Search questions, keywords, or answer text"
-              />
-              <button className="primary" onClick={() => setShowResults((value) => !value)}>
-                {showResults ? "Hide Results" : "Show Results"}
-              </button>
+              <input className="search" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search questions, keywords, or answer text" />
+              <button className="primary" onClick={() => setShowResults((value) => !value)}>{showResults ? "Hide Results" : "Show Results"}</button>
             </div>
 
             <div className="filters">
-              {[
-                ["all", "All Questions"],
-                ["unanswered", "Unanswered"],
-                ["answered", "Answered"],
-                ["flagged", "Flagged"],
-                ["multi", "Multi-select"]
-              ].map(([value, label]) => (
-                <button
-                  key={value}
-                  className={`pill ${filter === value ? "active" : ""}`}
-                  onClick={() => setFilter(value)}
-                >
-                  {label}
-                </button>
+              {[["all", "All Questions"], ["unanswered", "Unanswered"], ["answered", "Answered"], ["flagged", "Flagged"], ["excluded", "Excluded"], ["multi", "Multi-select"]].map(([value, label]) => (
+                <button key={value} className={`pill ${filter === value ? "active" : ""}`} onClick={() => setFilter(value)}>{label}</button>
               ))}
             </div>
           </section>
@@ -439,38 +376,36 @@ export default function App() {
             <section className="results-panel panel">
               <div className="results-head">
                 <div>
-                  <span className="eyebrow">Exam Result</span>
-                  <h2 className="results-title">Attempt Summary</h2>
+                  <span className="eyebrow">Strict Result</span>
+                  <h2 className="results-title">High-Confidence Score</h2>
                 </div>
                 <div className="result-score-ring">
-                  <span>{score === null ? completionScore : `${score}%`}</span>
-                  <small>{score === null ? "completion" : "score"}</small>
+                  <span>{submitted ? `${scoreSummary.percent}%` : `${progress}%`}</span>
+                  <small>{submitted ? "strict score" : "progress"}</small>
                 </div>
               </div>
 
               <div className="results-grid">
-                <div className="result-card accent">
-                  <strong>{attemptedCount}</strong>
-                  <span>attempted</span>
-                </div>
-                <div className="result-card">
-                  <strong>{unansweredCount}</strong>
-                  <span>unanswered</span>
-                </div>
-                <div className="result-card">
-                  <strong>{statusBreakdown.flagged + statusBreakdown.flaggedAnswered}</strong>
-                  <span>flagged</span>
-                </div>
-                <div className="result-card">
-                  <strong>{submittedAt ? new Date(submittedAt).toLocaleTimeString() : "In progress"}</strong>
-                  <span>submitted at</span>
-                </div>
+                <div className="result-card accent"><strong>{scoreSummary.correct}</strong><span>correct</span></div>
+                <div className="result-card"><strong>{scoreSummary.incorrect}</strong><span>incorrect</span></div>
+                <div className="result-card"><strong>{scoreSummary.blank}</strong><span>blank scored items</span></div>
+                <div className="result-card"><strong>{scoreSummary.excluded}</strong><span>excluded entries</span></div>
               </div>
 
               <div className="results-note">
-                {score === null
-                  ? "Exact right-answer scoring is ready in the UI, but the correct-answer key has not been provided yet. Right now this dashboard shows your completion score and attempt breakdown."
-                  : "Your exact score is shown above based on the configured answer key."}
+                Strict score is based on {strictScoredQuestionCount} high-confidence entries. Questions tied to ambiguous or outdated wording are excluded from scoring.
+              </div>
+
+              <div className="ambiguity-panel">
+                <h3 className="ambiguity-title">Excluded Question Numbers</h3>
+                <div className="ambiguity-list">
+                  {ambiguousQuestions.map((item) => (
+                    <div key={item.questionNumber} className="ambiguity-item">
+                      <strong>Question {item.questionNumber}</strong>
+                      <span>{item.reason}</span>
+                    </div>
+                  ))}
+                </div>
               </div>
 
               <div className="results-actions">
@@ -486,58 +421,38 @@ export default function App() {
             ) : (
               visibleQuestions.map((question, index) => {
                 const selected = new Set(answers[question.id] || []);
-                const status = getQuestionStatus(question, answers, flagged);
+                const status = submitted ? getQuestionResult(question.id, answers) : getQuestionStatus(question, answers, flagged);
+                const excluded = !strictAnswerKey[question.id];
                 return (
-                  <article
-                    key={question.id}
-                    className={`question ${submitted ? "locked" : ""} ${status}`}
-                    id={question.id}
-                    style={{ animationDelay: `${Math.min(index * 18, 240)}ms` }}
-                  >
+                  <article key={question.id} className={`question ${submitted ? "locked" : ""} ${status}`} id={question.id} style={{ animationDelay: `${Math.min(index * 18, 240)}ms` }}>
                     <div className="question-head">
                       <div>
-                        <div className="question-index">
-                          {question.label} · {ordinalSuffix(question.ordinal)} in deck
-                        </div>
+                        <div className="question-index">{question.label} · {ordinalSuffix(question.ordinal)} in deck</div>
                         <h3>{question.prompt}</h3>
                       </div>
                       <div className="question-actions">
-                        <button
-                          className={`flag-button ${flagged[question.id] ? "active" : ""}`}
-                          onClick={() => toggleFlag(question.id)}
-                          disabled={submitted}
-                        >
-                          {flagged[question.id] ? "Flagged" : "Flag for review"}
-                        </button>
-                        <div className="choice-badge">
-                          {question.choose > 1 ? `Choose ${question.choose}` : "Choose 1"}
-                        </div>
+                        <button className={`flag-button ${flagged[question.id] ? "active" : ""}`} onClick={() => toggleFlag(question.id)} disabled={submitted}>{flagged[question.id] ? "Flagged" : "Flag for review"}</button>
+                        <div className="choice-badge">{question.choose > 1 ? `Choose ${question.choose}` : "Choose 1"}</div>
                       </div>
                     </div>
 
                     <div className="options">
-                      {question.options.map((option, optionIndex) => (
-                        <label
-                          key={`${question.id}-${optionIndex}`}
-                          className={`option ${selected.has(optionIndex) ? "selected" : ""}`}
-                        >
-                          <input
-                            hidden
-                            disabled={submitted}
-                            type={question.choose > 1 ? "checkbox" : "radio"}
-                            checked={selected.has(optionIndex)}
-                            onChange={() => updateAnswer(question, optionIndex)}
-                          />
-                          <span className="option-key">{String.fromCharCode(65 + optionIndex)}</span>
-                          <span className="option-text">{option}</span>
-                          <span className="option-mark" aria-hidden="true" />
-                        </label>
-                      ))}
+                      {question.options.map((option, optionIndex) => {
+                        const reviewState = submitted ? getOptionReviewState(question.id, optionIndex, answers) : "neutral";
+                        return (
+                          <label key={`${question.id}-${optionIndex}`} className={`option ${selected.has(optionIndex) ? "selected" : ""} review-${reviewState}`}>
+                            <input hidden disabled={submitted} type={question.choose > 1 ? "checkbox" : "radio"} checked={selected.has(optionIndex)} onChange={() => updateAnswer(question, optionIndex)} />
+                            <span className="option-key">{String.fromCharCode(65 + optionIndex)}</span>
+                            <span className="option-text">{option}</span>
+                            <span className="option-mark" aria-hidden="true" />
+                          </label>
+                        );
+                      })}
                     </div>
 
                     <div className="question-foot">
                       <span>{selected.size ? `${selected.size} selected` : "No answer selected yet"}</span>
-                      <span>{flagged[question.id] ? "Marked for review" : `${question.options.length} options`}</span>
+                      <span>{submitted ? (excluded ? `Excluded from strict score · source Question ${getQuestionNumberLabel(question)}` : status === "correct" ? "Marked correct" : status === "incorrect" ? "Marked incorrect" : "Unanswered") : flagged[question.id] ? "Marked for review" : `${question.options.length} options`}</span>
                     </div>
                   </article>
                 );
@@ -552,22 +467,11 @@ export default function App() {
           <div className="modal-card panel" onClick={(event) => event.stopPropagation()}>
             <span className="eyebrow">Submit Attempt</span>
             <h2 className="modal-title">Ready to finish your exam?</h2>
-            <p className="modal-copy">
-              You have answered {answeredCount} of {quizQuestions.length} questions, with {unansweredCount} still blank and {flaggedCount} flagged for review.
-            </p>
+            <p className="modal-copy">You have answered {answeredCount} of {quizQuestions.length} entries. Your final strict score will ignore {ambiguousQuestions.length} ambiguous question numbers.</p>
             <div className="modal-grid">
-              <div className="result-card accent">
-                <strong>{answeredCount}</strong>
-                <span>answered</span>
-              </div>
-              <div className="result-card">
-                <strong>{unansweredCount}</strong>
-                <span>unanswered</span>
-              </div>
-              <div className="result-card">
-                <strong>{flaggedCount}</strong>
-                <span>flagged</span>
-              </div>
+              <div className="result-card accent"><strong>{answeredCount}</strong><span>answered</span></div>
+              <div className="result-card"><strong>{unansweredCount}</strong><span>unanswered</span></div>
+              <div className="result-card"><strong>{strictScoredQuestionCount}</strong><span>strictly scored</span></div>
             </div>
             <div className="modal-actions">
               <button className="ghost" onClick={() => setShowSubmitModal(false)}>Keep Reviewing</button>
